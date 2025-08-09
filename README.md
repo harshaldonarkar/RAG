@@ -1,17 +1,17 @@
 # Agentic RAG-Powered AI Research Assistant
 
-Open-source, offline-capable research assistant built for AllyNerds task. No API keys required for local modes. Supports both a native agent pipeline and a LangChain/LangGraph pipeline.
+Open-source, offline-capable research assistant built for AllyNerds task. No API keys required for local modes. Supports both a native agent pipeline and a LangChain/LangGraph pipeline. OpenAI is the preferred cloud backend for best quality.
 
 ## Specification
 
 ### 1) Scope & Objectives
 - Understand a research query, break it into sub-queries, retrieve relevant context from a vector DB, and synthesize a structured report with references.
-- Run fully offline using local models (Hugging Face or Ollama) and FAISS; or use cloud APIs (Gemini, Groq, OpenAI).
+- Run fully offline using local models (Hugging Face or Ollama) and FAISS; or use cloud APIs (OpenAI, Gemini, Groq).
 - Simple, transparent agent orchestration with a choice of native or LangGraph implementation.
 
 ### 2) Architecture Overview
 - Components:
-  - `LLMProvider`: Unified interface over Hugging Face (local), Ollama (local), Google Gemini (API), Groq (API), and OpenAI (API).
+- `LLMProvider`: Unified interface over OpenAI (API), Google Gemini (API), Groq (API), Hugging Face (local), and Ollama (local).
   - `EmbeddingProvider`: Sentence-Transformers embeddings.
   - `RAGRetriever`: Loads `.txt` docs from `documents/`, chunks, embeds, and builds FAISS index.
   - Agents:
@@ -50,14 +50,24 @@ Open-source, offline-capable research assistant built for AllyNerds task. No API
   - Ensures headings; appends a `References` section from source filenames.
 
 ### 5) LLM Backends
-- Hugging Face (local, default): auto-selects correct pipeline (`text-generation` vs `text2text-generation` for T5/FLAN family). Default: `distilgpt2`.
-- Ollama (local server): configurable model and options, e.g., `mistral:7b-instruct-q5_K_M`.
+- OpenAI (API) — preferred for best quality: `openai` client; e.g., `gpt-4o-mini`.
 - Google Gemini (API): `google-generativeai` client; e.g., `gemini-1.5-flash`.
 - Groq (API): `groq` client; e.g., `llama3-8b-8192`.
-- OpenAI (API): `openai` client; e.g., `gpt-4o-mini`.
+- Hugging Face (local): auto-selects correct pipeline (`text-generation` vs `text2text-generation` for T5/FLAN family). Default: `distilgpt2`.
+- Ollama (local server): configurable model and options, e.g., `mistral:7b-instruct-q5_K_M`.
 - Fallback: rule-based strings when models aren’t available.
 
 ### 6) Configuration (Env Vars)
+- OpenAI (API) — preferred:
+  - `OPENAI_API_KEY` (required)
+  - `OPENAI_MODEL` (default `gpt-4o-mini`)
+  - `OPENAI_TEMPERATURE` (default `0.3`)
+- Google Gemini (API):
+  - `GOOGLE_API_KEY` (required)
+  - `GEMINI_MODEL` (default `gemini-1.5-flash`)
+- Groq (API):
+  - `GROQ_API_KEY` (required)
+  - `GROQ_MODEL` (default `llama3-8b-8192`)
 - Hugging Face (local):
   - `HF_MODEL_NAME` (e.g., `google/flan-t5-small`) – optional.
   - Optional private Hub access: `HUGGINGFACE_HUB_TOKEN` or `huggingface-cli login`.
@@ -65,16 +75,6 @@ Open-source, offline-capable research assistant built for AllyNerds task. No API
   - `OLLAMA_MODEL` (e.g., `mistral:7b-instruct-q5_K_M`)
   - `OLLAMA_NUM_CTX` (default 8192; e.g., 16000)
   - `OLLAMA_TEMPERATURE` (default 0.3)
-- Google Gemini (API):
-  - `GOOGLE_API_KEY` (required)
-  - `GEMINI_MODEL` (default `gemini-1.5-flash`)
-- Groq (API):
-  - `GROQ_API_KEY` (required)
-  - `GROQ_MODEL` (default `llama3-8b-8192`)
-- OpenAI (API):
-  - `OPENAI_API_KEY` (required)
-  - `OPENAI_MODEL` (default `gpt-4o-mini`)
-  - `OPENAI_TEMPERATURE` (default `0.3`)
 
 Note: The app will load a `.env` if `python-dotenv` is installed; otherwise export env vars in your shell.
 
@@ -88,6 +88,7 @@ pip install -r requirements.txt
 python agentic_rag_assistant.py
 ```
 - Choose backend:
+  - Recommended: OpenAI (API; requires `OPENAI_API_KEY`)
   - 1) Hugging Face (local)
   - 2) Ollama (local)
   - 3) Fallback (rule-based)
@@ -160,7 +161,8 @@ asyncio.run(run_native_ollama())
 
 ## Quickstart (condensed)
 1) Install: `pip install -r requirements.txt`
-2) Choose backend:
+2) Choose backend (OpenAI preferred):
+   - OpenAI: `export OPENAI_API_KEY=...` (optional: `OPENAI_MODEL` and `OPENAI_TEMPERATURE`)
    - HF: `export HF_MODEL_NAME=google/flan-t5-small`
    - Ollama: `export OLLAMA_MODEL=mistral:7b-instruct-q5_K_M`
    - Gemini: `export GOOGLE_API_KEY=...` (optional: `GEMINI_MODEL`)
@@ -171,4 +173,4 @@ asyncio.run(run_native_ollama())
 ## Tech
 - Python, Transformers, Sentence-Transformers, FAISS, NumPy, Torch
 - Optional: LangChain, LangGraph
-- Optional: Google Generative AI (Gemini), Groq
+- Optional: OpenAI, Google Generative AI (Gemini), Groq
