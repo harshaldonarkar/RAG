@@ -2,6 +2,7 @@
 # Built for AllyNerds NLP Engineer Task - No API Keys Required!
 
 import os
+import re
 import json
 import asyncio
 from typing import List, Dict, Any, Optional
@@ -21,11 +22,22 @@ import importlib
 from typing import Callable
 import google.generativeai as genai 
 import groq as groq_mod  
-import openai as openai_mod 
+import openai as openai_mod
+try:
+    import anthropic as anthropic_mod
+except ImportError:
+    anthropic_mod = None
 from bs4 import BeautifulSoup 
 from pypdf import PdfReader  
 from docx import Document as DocxDocument  
-from dotenv import load_dotenv  
+from dotenv import load_dotenv
+
+try:
+    from rank_bm25 import BM25Okapi
+    _BM25_AVAILABLE = True
+except ImportError:
+    BM25Okapi = None
+    _BM25_AVAILABLE = False
 
 
 # LangChain / LangGraph (required)
@@ -128,7 +140,7 @@ class LLMProvider:
                 if not api_key:
                     raise RuntimeError("GOOGLE_API_KEY is not set")
                 genai.configure(api_key=api_key)
-                self.gemini_model_name = self.model_name or os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+                self.gemini_model_name = self.model_name or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
                 self.gemini_client = genai.GenerativeModel(self.gemini_model_name)
                 logger.info(f"Google Gemini model ready: {self.gemini_model_name}")
             except Exception as e:
@@ -143,7 +155,7 @@ class LLMProvider:
                 if not api_key:
                     raise RuntimeError("GROQ_API_KEY is not set")
                 self.groq_client = groq_mod.Groq(api_key=api_key)
-                self.groq_model_name = self.model_name or os.getenv("GROQ_MODEL", "llama3-8b-8192")
+                self.groq_model_name = self.model_name or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
                 logger.info(f"Groq client ready: {self.groq_model_name}")
             except Exception as e:
                 logger.error(f"Error initializing Groq: {e}")
@@ -156,7 +168,6 @@ class LLMProvider:
                 api_key = os.getenv("OPENAI_API_KEY")
                 if not api_key:
                     raise RuntimeError("OPENAI_API_KEY is not set")
-                # New SDK pattern
                 self.openai_client = openai_mod.OpenAI(api_key=api_key)
                 self.openai_model_name = self.model_name or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
                 self.openai_temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.3"))
@@ -164,7 +175,22 @@ class LLMProvider:
             except Exception as e:
                 logger.error(f"Error initializing OpenAI: {e}")
                 self._initialize_fallback()
-        
+
+        elif self.provider_type == "claude":
+            try:
+                if anthropic_mod is None:
+                    raise RuntimeError("anthropic package not installed")
+                api_key = os.getenv("ANTHROPIC_API_KEY")
+                if not api_key:
+                    raise RuntimeError("ANTHROPIC_API_KEY is not set")
+                self.claude_client = anthropic_mod.Anthropic(api_key=api_key)
+                self.claude_model_name = self.model_name or os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+                self.claude_temperature = float(os.getenv("CLAUDE_TEMPERATURE", "0.3"))
+                logger.info(f"Claude client ready: {self.claude_model_name}")
+            except Exception as e:
+                logger.error(f"Error initializing Claude: {e}")
+                self._initialize_fallback()
+
         else:
             self._initialize_fallback()
     
@@ -209,7 +235,10 @@ class LLMProvider:
         
         elif self.provider_type == "openai":
             return await self._generate_with_openai(prompt, max_tokens)
-        
+
+        elif self.provider_type == "claude":
+            return await self._generate_with_claude(prompt, max_tokens)
+
         else:
             return self._fallback_response(prompt)
     
@@ -291,6 +320,23 @@ class LLMProvider:
             logger.error(f"OpenAI error: {e}")
             return self._fallback_response(prompt)
     
+    async def _generate_with_claude(self, prompt: str, max_tokens: int) -> str:
+        try:
+            loop = asyncio.get_event_loop()
+            def _call():
+                message = self.claude_client.messages.create(
+                    model=self.claude_model_name,
+                    max_tokens=max_tokens,
+                    temperature=self.claude_temperature,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return message.content[0].text
+            text = await loop.run_in_executor(None, _call)
+            return text if text else self._fallback_response(prompt)
+        except Exception as e:
+            logger.error(f"Claude error: {e}")
+            return self._fallback_response(prompt)
+
     def _fallback_response(self, prompt: str) -> str:
         """Rule-based fallback responses"""
         prompt_lower = prompt.lower()
@@ -348,6 +394,166 @@ class EmbeddingProvider:
         logger.warning("Using random embeddings - install sentence-transformers for real embeddings")
         return np.random.randn(len(texts), 384).astype(np.float32)
 
+class Reranker:
+    """Cross-encoder reranker for re-scoring retrieved candidates.
+
+    Uses a small MS-MARCO cross-encoder by default — scores each (query, passage)
+    pair jointly, which is far more accurate than embedding cosine similarity alone.
+    """
+
+    DEFAULT_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+    def __init__(self, model_name: str = DEFAULT_MODEL):
+        self.model_name = model_name
+        self.model = None
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            from sentence_transformers.cross_encoder import CrossEncoder as CE
+            self.model = CE(self.model_name)
+            logger.info(f"✅ Reranker loaded: {self.model_name}")
+        except Exception as e:
+            logger.warning(f"Reranker unavailable ({e}); skipping reranking.")
+            self.model = None
+
+    def rerank(self, query: str, documents: List[Document], top_k: int) -> List[Document]:
+        """Return top_k documents sorted by cross-encoder relevance score."""
+        if self.model is None or not documents:
+            return documents[:top_k]
+        try:
+            pairs = [(query, doc.content) for doc in documents]
+            scores = self.model.predict(pairs)
+            scored = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
+            results = []
+            for score, doc in scored[:top_k]:
+                meta = dict(doc.metadata)
+                meta["rerank_score"] = float(score)
+                results.append(Document(content=doc.content, metadata=meta))
+            return results
+        except Exception as e:
+            logger.error(f"Reranking error: {e}")
+            return documents[:top_k]
+
+
+class WebSearcher:
+    """Fetches live web results to supplement local RAG retrieval.
+
+    Priority:
+      1. Tavily  — if TAVILY_API_KEY is set (clean, AI-optimised excerpts)
+      2. DuckDuckGo — free fallback, no API key required
+    """
+
+    def __init__(self) -> None:
+        self._tavily = None
+        self._ddg_available = False
+        self._initialize()
+
+    def _initialize(self) -> None:
+        tavily_key = os.getenv("TAVILY_API_KEY")
+        if tavily_key:
+            try:
+                from tavily import TavilyClient
+                self._tavily = TavilyClient(api_key=tavily_key)
+                logger.info("✅ Tavily web search ready")
+                return
+            except Exception as e:
+                logger.warning(f"Tavily init failed: {e}")
+        try:
+            from duckduckgo_search import DDGS  # noqa: F401
+            self._ddg_available = True
+            logger.info("✅ DuckDuckGo web search ready (no API key)")
+        except ImportError:
+            logger.warning("Web search unavailable — install duckduckgo-search or set TAVILY_API_KEY")
+
+    @property
+    def is_available(self) -> bool:
+        return self._tavily is not None or self._ddg_available
+
+    async def search(self, query: str, max_results: int = 4) -> List[Document]:
+        """Return web results as Document objects, or [] if unavailable."""
+        if self._tavily:
+            return await self._tavily_search(query, max_results)
+        if self._ddg_available:
+            return await self._ddg_search(query, max_results)
+        return []
+
+    async def _tavily_search(self, query: str, max_results: int) -> List[Document]:
+        loop = asyncio.get_event_loop()
+        def _call():
+            resp = self._tavily.search(query, max_results=max_results, search_depth="basic")
+            docs = []
+            for r in resp.get("results", []):
+                content = f"{r.get('title', '')}\n\n{r.get('content', '')}"
+                docs.append(Document(
+                    content=content,
+                    metadata={"source": r.get("url", "web"), "type": "web", "score": r.get("score", 0.5)},
+                ))
+            return docs
+        try:
+            return await loop.run_in_executor(None, _call)
+        except Exception as e:
+            logger.error(f"Tavily search error: {e}")
+            return []
+
+    async def _ddg_search(self, query: str, max_results: int) -> List[Document]:
+        loop = asyncio.get_event_loop()
+        def _call():
+            from duckduckgo_search import DDGS
+            docs = []
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=max_results):
+                    content = f"{r.get('title', '')}\n\n{r.get('body', '')}"
+                    docs.append(Document(
+                        content=content,
+                        metadata={"source": r.get("href", "web"), "type": "web", "score": 0.5},
+                    ))
+            return docs
+        try:
+            return await loop.run_in_executor(None, _call)
+        except Exception as e:
+            logger.error(f"DuckDuckGo search error: {e}")
+            return []
+
+
+class ConversationMemory:
+    """Stores recent conversation turns and provides context for follow-up queries.
+
+    Two uses:
+      1. Query rewriting — resolve references like "it", "that", "the second point"
+         into standalone queries before hitting the retrieval pipeline.
+      2. Synthesis context — let the synthesizer know what was already covered so
+         the new report builds on (not repeats) prior answers.
+    """
+
+    MAX_TURNS = 6  # keep last 6 turns (3 exchanges)
+
+    def __init__(self) -> None:
+        self.turns: List[Dict[str, str]] = []  # [{"query": ..., "summary": ...}]
+
+    def add(self, query: str, summary: str) -> None:
+        self.turns.append({"query": query, "summary": summary[:400]})
+        if len(self.turns) > self.MAX_TURNS:
+            self.turns.pop(0)
+
+    def is_empty(self) -> bool:
+        return len(self.turns) == 0
+
+    def format_for_rewrite(self) -> str:
+        """Compact history for the query-rewriting prompt."""
+        return "\n".join(
+            f"Turn {i}: User asked: \"{t['query']}\""
+            for i, t in enumerate(self.turns, 1)
+        )
+
+    def format_for_synthesis(self) -> str:
+        """Prior Q&A pairs injected into the synthesis prompt."""
+        lines = []
+        for t in self.turns:
+            lines.append(f"Previous question: {t['query']}\nPrevious answer summary: {t['summary']}")
+        return "\n\n".join(lines)
+
+
 class Agent(ABC):
     """Abstract base class for all agents"""
     
@@ -363,10 +569,33 @@ class Agent(ABC):
 
 class QueryUnderstandingAgent(Agent):
     """Agent that analyzes and breaks down user queries"""
-    
+
     def __init__(self, llm_provider: LLMProvider):
         super().__init__("QueryUnderstandingAgent", llm_provider)
-    
+
+    async def rewrite_query(self, query: str, memory: "ConversationMemory") -> str:
+        """Rewrite a follow-up query into a self-contained standalone query.
+
+        Resolves references like "tell me more", "what about the second point",
+        "and safety?" using the conversation history.
+        """
+        if memory.is_empty():
+            return query
+        prompt = (
+            f"Given this conversation history:\n{memory.format_for_rewrite()}\n\n"
+            f"Rewrite the following follow-up message as a complete, standalone research query "
+            f"that can be understood without the history. "
+            f"If it is already self-contained, return it unchanged. "
+            f"Output only the rewritten query, nothing else.\n\n"
+            f"Follow-up: \"{query}\"\nStandalone query:"
+        )
+        try:
+            rewritten = await self.llm_provider.generate_text(prompt, max_tokens=80)
+            rewritten = rewritten.strip().strip('"').strip("'")
+            return rewritten if len(rewritten) > 5 else query
+        except Exception:
+            return query
+
     async def process(self, query: str) -> ResearchQuery:
         """Analyze query intent and break it down into sub-queries"""
         
@@ -417,6 +646,94 @@ JSON:"""
             priority=3
         )
 
+class SemanticChunker:
+    """Splits documents at topic-shift boundaries detected via embedding similarity.
+
+    Algorithm:
+      1. Split text into sentences (regex, no extra deps)
+      2. Batch-embed all sentences
+      3. Walk consecutive pairs: when cosine similarity drops below `split_threshold`
+         OR the running chunk would exceed `max_words`, close the current chunk
+      4. Merge orphan sentences (<= MIN_SENTENCE_WORDS) into the previous chunk
+      5. Falls back to the caller's word-based chunker on any error
+
+    Produces coherent chunks where each chunk stays on one topic.
+    """
+
+    MIN_SENTENCE_WORDS = 4   # discard/merge sentences shorter than this
+    SPLIT_THRESHOLD    = 0.35  # cosine similarity below which we start a new chunk
+
+    # Regex that splits on sentence-ending punctuation followed by whitespace
+    _SENTENCE_RE = re.compile(r'(?<=[.!?])\s+')
+
+    def __init__(self, embedding_provider: "EmbeddingProvider") -> None:
+        self.embedding_provider = embedding_provider
+
+    def chunk(self, text: str, max_words: int = 200) -> List[str]:
+        """Return a list of semantically coherent text chunks."""
+        sentences = self._split_sentences(text)
+        if len(sentences) <= 2:
+            # Too short to bother with semantics — return as one chunk
+            return [text.strip()] if text.strip() else []
+
+        try:
+            return self._semantic_split(sentences, max_words)
+        except Exception as e:
+            logger.warning(f"Semantic chunking failed ({e}); falling back to sentence groups")
+            return self._naive_sentence_groups(sentences, max_words)
+
+    # ------------------------------------------------------------------
+    def _split_sentences(self, text: str) -> List[str]:
+        raw = self._SENTENCE_RE.split(text.strip())
+        return [s.strip() for s in raw if len(s.split()) >= self.MIN_SENTENCE_WORDS]
+
+    def _semantic_split(self, sentences: List[str], max_words: int) -> List[str]:
+        # Batch embed (reuse existing provider — no extra model load)
+        embs = self.embedding_provider.encode(sentences).astype(np.float32)
+        # Normalise for cosine similarity
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        norms = np.where(norms == 0.0, 1.0, norms)
+        embs = embs / norms
+
+        chunks: List[str] = []
+        current: List[str] = [sentences[0]]
+        current_words: int = len(sentences[0].split())
+
+        for i in range(1, len(sentences)):
+            sim = float(np.dot(embs[i - 1], embs[i]))
+            sw = len(sentences[i].split())
+            topic_shift = sim < self.SPLIT_THRESHOLD
+            size_overflow = (current_words + sw) > max_words
+
+            if (topic_shift or size_overflow) and current:
+                chunks.append(" ".join(current))
+                current = [sentences[i]]
+                current_words = sw
+            else:
+                current.append(sentences[i])
+                current_words += sw
+
+        if current:
+            chunks.append(" ".join(current))
+
+        # Drop empty / tiny chunks
+        return [c for c in chunks if len(c.split()) >= self.MIN_SENTENCE_WORDS]
+
+    def _naive_sentence_groups(self, sentences: List[str], max_words: int) -> List[str]:
+        """Simple fallback: group sentences until max_words is hit."""
+        chunks, current, current_words = [], [], 0
+        for s in sentences:
+            sw = len(s.split())
+            if current and current_words + sw > max_words:
+                chunks.append(" ".join(current))
+                current, current_words = [], 0
+            current.append(s)
+            current_words += sw
+        if current:
+            chunks.append(" ".join(current))
+        return chunks
+
+
 class RAGRetriever:
     """RAG pipeline using sentence-transformers and FAISS (cosine similarity, overlapping chunks)."""
     
@@ -427,16 +744,24 @@ class RAGRetriever:
         chunk_overlap_words: int = DEFAULT_CHUNK_OVERLAP_WORDS,
         use_cosine_similarity: bool = True,
         embedding_model_name: str = "all-MiniLM-L6-v2",
+        use_hybrid: bool = True,
+        use_reranking: bool = True,
+        reranker_model: str = Reranker.DEFAULT_MODEL,
+        use_semantic_chunking: bool = True,
     ):
         self.documents_path = documents_path
         self.embedding_provider = EmbeddingProvider(embedding_model_name)
         self.chunk_size_words = max(50, chunk_size_words)
         self.chunk_overlap_words = max(0, min(self.chunk_size_words - 10, chunk_overlap_words))
         self.use_cosine_similarity = use_cosine_similarity
-        
+        self.use_hybrid = use_hybrid and _BM25_AVAILABLE
+        self.reranker = Reranker(reranker_model) if use_reranking else None
+        self.semantic_chunker = SemanticChunker(self.embedding_provider) if use_semantic_chunking else None
+
         self.documents: List[Document] = []
         self.embeddings: Optional[np.ndarray] = None
         self.index = None
+        self.bm25_index = None
         self._id_to_doc_idx: List[int] = []
         self._load_and_index_documents()
     
@@ -457,8 +782,11 @@ class RAGRetriever:
                     try:
                         content = self._read_document_file(filepath)
                         if content:
-                            # Split into overlapping chunks
-                            chunks = self._split_text_into_overlapping_chunks(content)
+                            # Split using semantic chunking if available, else overlapping word chunks
+                            if self.semantic_chunker:
+                                chunks = self.semantic_chunker.chunk(content, self.chunk_size_words)
+                            else:
+                                chunks = self._split_text_into_overlapping_chunks(content)
                             for i, chunk in enumerate(chunks):
                                 rel_source = os.path.relpath(filepath, self.documents_path)
                                 self.documents.append(Document(
@@ -499,17 +827,20 @@ class RAGRetriever:
                 self.index = faiss.IndexFlatL2(dimension)
             
             self.index.add(self.embeddings)
-            
+
             logger.info(f"✅ Indexed {len(self.documents)} document chunks")
             # Save cache
             try:
                 self._save_index_cache()
             except Exception as e:
                 logger.warning(f"Could not save index cache: {e}")
-            
+
         except Exception as e:
             logger.error(f"Error creating FAISS index: {e}")
             self.index = None
+
+        # Build BM25 index (always rebuilt from in-memory chunks — fast, no cache needed)
+        self._build_bm25_index()
 
     def _read_document_file(self, filepath: str) -> str:
         """Best-effort read for multiple formats: txt, md, html, pdf, docx."""
@@ -586,6 +917,40 @@ class RAGRetriever:
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         norms = np.where(norms == 0.0, 1.0, norms)
         return vectors / norms
+
+    # ------------------
+    # BM25 / hybrid helpers
+    # ------------------
+    def _build_bm25_index(self) -> None:
+        """Build an in-memory BM25 index from the current document chunks."""
+        if not self.use_hybrid or not self.documents:
+            self.bm25_index = None
+            return
+        try:
+            tokenized = [doc.content.lower().split() for doc in self.documents]
+            self.bm25_index = BM25Okapi(tokenized)
+            logger.info(f"✅ BM25 index built over {len(self.documents)} chunks")
+        except Exception as e:
+            logger.warning(f"BM25 index build failed: {e}")
+            self.bm25_index = None
+
+    @staticmethod
+    def _reciprocal_rank_fusion(
+        dense_indices: List[int],
+        sparse_indices: List[int],
+        k: int = 60,
+    ) -> List[int]:
+        """Combine two ranked lists using Reciprocal Rank Fusion (RRF).
+
+        Returns indices sorted by descending fused score.
+        k=60 is the standard RRF constant that reduces the impact of very high ranks.
+        """
+        scores: Dict[int, float] = {}
+        for rank, idx in enumerate(dense_indices):
+            scores[idx] = scores.get(idx, 0.0) + 1.0 / (k + rank + 1)
+        for rank, idx in enumerate(sparse_indices):
+            scores[idx] = scores.get(idx, 0.0) + 1.0 / (k + rank + 1)
+        return sorted(scores, key=lambda i: scores[i], reverse=True)
     
     def _create_sample_documents(self):
         """Create sample documents for demonstration"""
@@ -614,45 +979,91 @@ Research Methodology in AI. Systematic research methodology is crucial for advan
         
         logger.info(f"Created {len(sample_docs)} sample documents")
     
-    async def retrieve_context(self, query: str, k: int = DEFAULT_TOP_K) -> List[Document]:
-        """Retrieve relevant document chunks for a query (with scores in metadata)."""
+    async def retrieve_context(
+        self,
+        query: str,
+        k: int = DEFAULT_TOP_K,
+        hyde_passage: Optional[str] = None,
+    ) -> List[Document]:
+        """Retrieve relevant document chunks using hybrid search + optional reranking.
+
+        Pipeline:
+          1. Dense (FAISS): embed hyde_passage (if provided) or raw query
+             Sparse (BM25): always uses raw query tokens
+             → fuse via RRF → fetch_k candidates
+          2. Cross-encoder reranking of candidates → top k
+        """
         if not self.index or not self.documents:
             return []
-        
+
         try:
-            # Encode query
-            query_embedding = self.embedding_provider.encode([query]).astype(np.float32)
+            # Fetch more candidates when reranking so the cross-encoder has a larger pool
+            reranking_on = self.reranker is not None and self.reranker.model is not None
+            fetch = min(k * 5 if reranking_on else k * 4, len(self.documents))
+
+            # --- Dense retrieval (FAISS) ---
+            # HyDE: use the hypothetical passage for embedding when available;
+            # it sits closer to real documents in the embedding space than a short question
+            dense_query = hyde_passage if hyde_passage else query
+            query_embedding = self.embedding_provider.encode([dense_query]).astype(np.float32)
             if self.use_cosine_similarity:
                 try:
                     faiss.normalize_L2(query_embedding)
                 except Exception:
                     query_embedding = self._normalize_vectors(query_embedding)
-            
-            # Search FAISS index
-            distances, indices = self.index.search(query_embedding, min(k * 3, len(self.documents)))
-            
-            # Prepare scored, de-duplicated results by source+chunk_id
-            results: List[Document] = []
-            seen_keys = set()
-            row = 0
-            for rank, idx in enumerate(indices[row]):
-                if idx < 0 or idx >= len(self.documents):
-                    continue
+
+            distances, faiss_indices = self.index.search(query_embedding, fetch)
+            dense_ranked: List[int] = [
+                int(idx) for idx in faiss_indices[0]
+                if 0 <= int(idx) < len(self.documents)
+            ]
+
+            # --- Sparse retrieval (BM25) ---
+            if self.use_hybrid and self.bm25_index is not None:
+                tokens = query.lower().split()
+                bm25_scores = self.bm25_index.get_scores(tokens)
+                sparse_ranked: List[int] = [
+                    int(i) for i in np.argsort(bm25_scores)[::-1][:fetch]
+                ]
+                fused = self._reciprocal_rank_fusion(dense_ranked, sparse_ranked)
+                ranked_indices = fused
+                retrieval_mode = "hybrid"
+            else:
+                ranked_indices = dense_ranked
+                retrieval_mode = "dense"
+
+            # --- Build de-duplicated candidate list (up to fetch size) ---
+            candidates: List[Document] = []
+            seen_keys: set = set()
+            for idx in ranked_indices:
+                if len(candidates) >= fetch:
+                    break
                 doc = self.documents[idx]
-                key = (doc.metadata.get('source'), doc.metadata.get('chunk_id'))
+                key = (doc.metadata.get("source"), doc.metadata.get("chunk_id"))
                 if key in seen_keys:
                     continue
                 seen_keys.add(key)
-                score = float(distances[row][rank])
-                # Attach score to metadata copy
                 meta = dict(doc.metadata)
-                meta["score"] = score
-                results.append(Document(content=doc.content, metadata=meta))
-                if len(results) >= k:
-                    break
-            
+                if idx in dense_ranked:
+                    meta["score"] = float(distances[0][dense_ranked.index(idx)])
+                else:
+                    meta["score"] = 0.0
+                meta["retrieval_mode"] = retrieval_mode
+                candidates.append(Document(content=doc.content, metadata=meta))
+
+            # --- Rerank candidates with cross-encoder, then keep top-k ---
+            if reranking_on and len(candidates) > k:
+                loop = asyncio.get_event_loop()
+                results = await loop.run_in_executor(
+                    None, lambda: self.reranker.rerank(query, candidates, k)
+                )
+                for doc in results:
+                    doc.metadata["retrieval_mode"] = retrieval_mode + "+rerank"
+            else:
+                results = candidates[:k]
+
             return results
-            
+
         except Exception as e:
             logger.error(f"Error retrieving context: {e}")
             return []
@@ -788,30 +1199,78 @@ Plan:"""
 
 class SearcherAgent(Agent):
     """Agent that searches and retrieves relevant information"""
-    
-    def __init__(self, llm_provider: LLMProvider, rag_retriever: RAGRetriever):
+
+    def __init__(
+        self,
+        llm_provider: LLMProvider,
+        rag_retriever: RAGRetriever,
+        use_hyde: bool = True,
+        web_searcher: Optional["WebSearcher"] = None,
+    ):
         super().__init__("SearcherAgent", llm_provider)
         self.rag_retriever = rag_retriever
-    
+        self.use_hyde = use_hyde
+        self.web_searcher = web_searcher
+
+    async def _generate_hyde_passage(self, query: str) -> Optional[str]:
+        """Generate a hypothetical document passage for the query (HyDE).
+
+        The generated passage is embedded instead of the raw query for dense retrieval.
+        It resembles a real document answer, so it aligns better with the corpus embeddings.
+        """
+        prompt = (
+            f'Write a short, factual paragraph (3-5 sentences) that directly answers '
+            f'the following question as if from a research document:\n\n'
+            f'Question: "{query}"\n\nParagraph:'
+        )
+        try:
+            passage = await self.llm_provider.generate_text(prompt, max_tokens=150)
+            passage = passage.strip()
+            return passage if len(passage) > 20 else None
+        except Exception as e:
+            logger.warning(f"HyDE generation failed: {e}")
+            return None
+
     async def process(self, query: str) -> Dict[str, Any]:
-        """Search for relevant information using RAG"""
-        
-        # Retrieve relevant documents
-        relevant_docs = await self.rag_retriever.retrieve_context(query, k=3)
-        
-        if not relevant_docs:
+        """Search for relevant information using RAG + web search in parallel."""
+
+        # HyDE: generate a hypothetical passage for dense retrieval
+        hyde_passage: Optional[str] = None
+        if self.use_hyde:
+            hyde_passage = await self._generate_hyde_passage(query)
+
+        # Fire RAG and web search in parallel
+        rag_task = self.rag_retriever.retrieve_context(query, k=3, hyde_passage=hyde_passage)
+        web_task = (
+            self.web_searcher.search(query, max_results=3)
+            if self.web_searcher and self.web_searcher.is_available
+            else asyncio.sleep(0, result=[])
+        )
+        relevant_docs, web_docs = await asyncio.gather(rag_task, web_task)
+
+        all_docs: List[Document] = list(relevant_docs) + list(web_docs)
+
+        if not all_docs:
             return {
-                "content": "No relevant documents found in the knowledge base.",
+                "content": "No relevant documents found in the knowledge base or web.",
                 "sources": [],
-                "relevance_score": 0.0
+                "relevance_score": 0.0,
+                "web_results": 0,
             }
-        
-        # Combine content
-        content_pieces = [doc.content for doc in relevant_docs]
-        sources = [doc.metadata.get('source', 'unknown') for doc in relevant_docs]
-        scored = [doc.metadata.get('score') for doc in relevant_docs]
+
+        # Build combined content — label web results so LLM knows their origin
+        content_pieces, sources, scored = [], [], []
+        web_count = 0
+        for doc in all_docs:
+            is_web = doc.metadata.get("type") == "web"
+            content_pieces.append(f"[Web] {doc.content}" if is_web else doc.content)
+            sources.append(doc.metadata.get("source", "unknown"))
+            scored.append(doc.metadata.get("score"))
+            if is_web:
+                web_count += 1
+
         combined_content = "\n\n".join(content_pieces)
-        
+
         # Use LLM to process the content
         prompt = f"""Based on the following retrieved information, provide a focused summary for this query: "{query}"
 
@@ -819,21 +1278,22 @@ Retrieved Information:
 {combined_content}
 
 Please provide a clear, organized summary that directly addresses the query:"""
-        
+
         processed_content = await self.llm_provider.generate_text(prompt, max_tokens=400)
-        
-        # Estimate relevance using average score (cosine/IP -> higher is better)
-        if scored and all(s is not None for s in scored):
-            relevance = float(np.mean(scored))
-            # Scores are in [-1, 1] for cosine; clamp to [0, 1]
+
+        # Estimate relevance
+        valid_scores = [s for s in scored if s is not None]
+        if valid_scores:
+            relevance = float(np.mean(valid_scores))
             relevance_norm = max(0.0, min((relevance + 1.0) / 2.0, 1.0))
         else:
-            relevance_norm = min(len(relevant_docs) / float(DEFAULT_TOP_K), 1.0)
+            relevance_norm = min(len(all_docs) / float(DEFAULT_TOP_K), 1.0)
 
         return {
             "content": processed_content,
             "sources": list(set(sources)),
-            "relevance_score": relevance_norm
+            "relevance_score": relevance_norm,
+            "web_results": web_count,
         }
 
 class SynthesizerAgent(Agent):
@@ -864,10 +1324,17 @@ class SynthesizerAgent(Agent):
         
         combined_content = "\n\n---\n\n".join(all_content)
         
+        # Include prior conversation context so the report builds on previous answers
+        prior_context = research_data.get("prior_context", "")
+        context_block = (
+            f"\n\nPrior conversation context (do not repeat, but build upon it):\n{prior_context}\n"
+            if prior_context else ""
+        )
+
         prompt = f"""Create a comprehensive research report for: "{query}"
 
 Research Plan: {json.dumps(plan, indent=2)}
-
+{context_block}
 Gathered Information:
 {combined_content}
 
@@ -915,7 +1382,11 @@ class AgenticResearchAssistant:
         # Initialize agents
         self.query_agent = QueryUnderstandingAgent(self.llm_provider)
         self.planner_agent = PlannerAgent(self.llm_provider)
-        self.searcher_agent = SearcherAgent(self.llm_provider, self.rag_retriever)
+        self.web_searcher = WebSearcher()
+        self.searcher_agent = SearcherAgent(
+            self.llm_provider, self.rag_retriever,
+            use_hyde=True, web_searcher=self.web_searcher,
+        )
         self.synthesizer_agent = SynthesizerAgent(self.llm_provider)
         
         # Architecture selection: 'native' or 'langgraph'
@@ -930,22 +1401,32 @@ class AgenticResearchAssistant:
         if self.lc_enabled:
             logger.info("LangChain/LangGraph mode enabled")
     
-    async def research(self, query: str) -> ResearchResult:
-        """Main research method that orchestrates all agents"""
-        
+    async def research(
+        self,
+        query: str,
+        memory: Optional["ConversationMemory"] = None,
+    ) -> ResearchResult:
+        """Main research method that orchestrates all agents.
+
+        Args:
+            query:  The user's question (may be a follow-up referencing prior turns).
+            memory: Optional conversation memory for query rewriting and synthesis context.
+        """
         logger.info(f"🔍 Starting research for: '{query}'")
-        
+
         # If LangGraph mode is enabled, run the graph orchestration
         if self.lc_enabled:
             try:
                 return await self._research_with_langgraph(query)
             except Exception as e:
                 logger.error(f"LangGraph path failed: {e}. Falling back to native.")
-                # continue to native path
-        
+
         try:
-            # Step 1: Understand the query
+            # Step 1: Understand the query (with optional rewrite for follow-ups)
             logger.info("Step 1: Analyzing query...")
+            if memory and not memory.is_empty():
+                query = await self.query_agent.rewrite_query(query, memory)
+                logger.info(f"✅ Query rewritten to: '{query}'")
             research_query = await self.query_agent.process(query)
             logger.info(f"✅ Query analyzed. Intent: {research_query.intent}")
             
@@ -973,7 +1454,8 @@ class AgenticResearchAssistant:
                 "query": query,
                 "search_results": search_results,
                 "plan": plan,
-                "research_query": research_query
+                "research_query": research_query,
+                "prior_context": memory.format_for_synthesis() if memory and not memory.is_empty() else "",
             }
             
             final_result = await self.synthesizer_agent.process(research_data)

@@ -1,3 +1,5 @@
+chainlit>=2.0.0
+rank-bm25>=0.2.2
 sentence-transformers>=2.7.0
 faiss-cpu>=1.7.4
 transformers>=4.41.0
@@ -10,6 +12,9 @@ langchain-community
 google-generativeai
 groq
 openai>=1.30.0
+anthropic>=0.86.0
+duckduckgo-search>=6.0.0
+tavily-python>=0.5.0
 python-dotenv>=1.0.1
 beautifulsoup4>=4.12.0
 pypdf>=4.2.0
